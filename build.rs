@@ -228,7 +228,6 @@ fn main() {
         .blocklist_type("scap_fd_type")
         .blocklist_type("scap_l4_proto")
         .blocklist_var("PPM_.*")
-        .emit_clang_ast()
         .generate()
         .expect("Unable to generate bindings");
 
