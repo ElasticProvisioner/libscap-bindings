@@ -34,6 +34,49 @@ fn main() {
     let target = std::env::var("TARGET").unwrap();
     let is_musl = target.contains("musl");
 
+    // Offline hook: copy a pre-fetched falcosecurity/libs tree instead of
+    // cloning. The tree need not contain .git — .git-less trees take their
+    // version strings from VENDOR_LIBS_VERSION / VENDOR_DRIVER_VERSION (see
+    // below).
+    println!("cargo:rerun-if-env-changed=VENDOR_LIBSCAP_SRC_DIR");
+    // A tree copied from a previous source path must not win silently — the
+    // stamp records where the tree came from so it can be recopied when the
+    // path changes (e.g. a pin bump), or discarded when the hook is unset.
+    let stamp = out_dir.join("external-libscap.src-stamp");
+    if let Ok(src) = env::var("VENDOR_LIBSCAP_SRC_DIR") {
+        // The pinned SHA is part of the stamp so a pin bump forces a recopy
+        // even when the source path is unchanged.
+        let stamp_val = format!("{LIBSCAP_CHECKOUT_SHA} {src}");
+        let stale = fs::read_to_string(&stamp)
+            .map(|s| s != stamp_val)
+            .unwrap_or(true);
+        if stale && repo_dir.exists() {
+            fs::remove_dir_all(&repo_dir).expect("remove stale libscap tree");
+        }
+        if !repo_dir.exists() {
+            let status = Command::new("cp")
+                .args([
+                    "-r",
+                    "--no-preserve=mode,ownership",
+                    &src,
+                    repo_dir.to_str().unwrap(),
+                ])
+                .status()
+                .expect("failed to copy VENDOR_LIBSCAP_SRC_DIR");
+            assert!(status.success(), "copy of VENDOR_LIBSCAP_SRC_DIR failed");
+            fs::write(&stamp, &stamp_val).expect("write libscap src stamp");
+        }
+    } else if stamp.exists() {
+        // Hook unset after a vendored build: drop the copied tree so the
+        // clone path below restores upstream behavior, and the cmake build
+        // dir so the vendored version defines don't linger in CMakeCache.
+        if repo_dir.exists() {
+            fs::remove_dir_all(&repo_dir).expect("remove vendored libscap tree");
+        }
+        let _ = fs::remove_dir_all(out_dir.join("build"));
+        fs::remove_file(&stamp).expect("remove libscap src stamp");
+    }
+
     // The `bpftool` binary is a build dep of libscap. Start its download in
     // the background so it overlaps with the git fetch below (both are
     // network-bound); it is then extracted into the repo dir so we can tell
@@ -82,6 +125,24 @@ fn main() {
         .define("BUILD_LIBSCAP_MODERN_BPF", "ON")
         .define("ENABLE_PIC", "ON")
         .define("MUSL_OPTIMIZED_BUILD", if is_musl { "ON" } else { "OFF" });
+
+    // Version strings normally come from `git describe` in the clone. A
+    // vendored tree has no .git, so pass the caller-provided versions —
+    // falling back to GetVersionFromGit's own no-git default rather than
+    // letting git walk up from OUT_DIR and describe whatever enclosing repo
+    // it happens to find.
+    println!("cargo:rerun-if-env-changed=VENDOR_LIBS_VERSION");
+    println!("cargo:rerun-if-env-changed=VENDOR_DRIVER_VERSION");
+    if !repo_dir.join(".git").exists() {
+        cmake_config.define(
+            "FALCOSECURITY_LIBS_VERSION",
+            env::var("VENDOR_LIBS_VERSION").unwrap_or_else(|_| "0.0.0".into()),
+        );
+        cmake_config.define(
+            "DRIVER_VERSION",
+            env::var("VENDOR_DRIVER_VERSION").unwrap_or_else(|_| "0.0.0".into()),
+        );
+    }
 
     // libscap eBPF prog loading fails the kernel verifier for kernels < 6.16
     // if the eBPF objects built with newer clang (> 16 or so).
@@ -282,14 +343,25 @@ type BpftoolDownload = Option<thread::JoinHandle<Result<Vec<u8>>>>;
 /// with the libscap git fetch. Skipped (returns None) when a previously
 /// downloaded archive with a good checksum is already in place.
 fn spawn_bpftool_download(repo_dir: &Path) -> BpftoolDownload {
+    println!("cargo:rerun-if-env-changed=VENDOR_BPFTOOL_ARCHIVE");
     let (arch, expected_sha) = get_arch_sha();
     let archive = repo_dir.join("bpftool").join(archive_name(&arch));
     if archive_checksum_ok(&archive, &expected_sha) {
         return None;
     }
-    Some(thread::spawn(move || {
-        download_bpftool_bytes(&arch, &expected_sha)
+    // Offline hook: read a pre-fetched archive instead of downloading,
+    // enforcing the same digest the download path does.
+    let vendored = env::var("VENDOR_BPFTOOL_ARCHIVE").ok();
+    Some(thread::spawn(move || match vendored {
+        Some(path) => read_vendored_bpftool(&path, &expected_sha),
+        None => download_bpftool_bytes(&arch, &expected_sha),
     }))
+}
+
+fn read_vendored_bpftool(path: &str, expected_sha: &str) -> Result<Vec<u8>> {
+    let contents = fs::read(path).with_context(|| format!("reading {path}"))?;
+    verify_sha256(&contents, expected_sha, path)?;
+    Ok(contents)
 }
 
 /// Extract the bpftool binary into `<repo>/bpftool/`, first landing the
@@ -398,16 +470,21 @@ fn download_bpftool_bytes(arch: &str, expected_sha: &str) -> Result<Vec<u8>> {
         .read_to_vec()
         .with_context(|| format!("reading bpftool response body from {url}"))?;
 
-    let actual_checksum = sha256::digest(content.as_slice());
+    verify_sha256(&content, expected_sha, &url)?;
+    Ok(content)
+}
+
+fn verify_sha256(contents: &[u8], expected_sha: &str, source: &str) -> Result<()> {
+    let actual_checksum = sha256::digest(contents);
     if actual_checksum != expected_sha {
         bail!(
-            "checksum mismatch downloading {}: expected: {}, got: {}",
-            url,
+            "checksum mismatch for {}: expected: {}, got: {}",
+            source,
             expected_sha,
             actual_checksum
         );
     }
-    Ok(content)
+    Ok(())
 }
 
 /// returns a relative path to the bpftool binary as a string (like `bpftool/bpftool`).
