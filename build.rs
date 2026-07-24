@@ -48,6 +48,26 @@ fn main() {
     // so we can tell libscap's CMAKE to use the local one, rather than try to find a system binary.
     let relative_exe = fetch_bpftool(&repo_dir).expect("must fetch bpftool build dep");
 
+    // The cmake-generated compile rules honor CMAKE_C_COMPILER_LAUNCHER
+    // (sccache/ccache) from the environment, but two libscap build steps
+    // bypass it: the modern_bpf eBPF objects are compiled by
+    // ${MODERN_CLANG_EXE} inside add_custom_command rules, and libbpf builds
+    // through a raw `make` BUILD_COMMAND with an unwrapped CC. Shim both
+    // through the launcher so their compiles are cached too.
+    let launcher = env::var("CMAKE_C_COMPILER_LAUNCHER")
+        .ok()
+        .filter(|launcher| !launcher.is_empty());
+    let mut modern_clang_shim = None;
+    let mut libbpf_cc_shim = None;
+    if cfg!(unix)
+        && let Some(launcher) = &launcher
+    {
+        let clang = env::var("MODERN_CLANG_EXE").unwrap_or_else(|_| "clang".to_string());
+        modern_clang_shim = write_shim(&out_dir, "launcher-clang", launcher, &clang).ok();
+        libbpf_cc_shim = write_shim(&out_dir, "launcher-cc", launcher, "cc").ok();
+    }
+    patch_libbpf_build(&repo_dir, libbpf_cc_shim.as_deref());
+
     let mut cmake_config = cmake::Config::new(&repo_dir);
     cmake_config
         .define("USE_BUNDLED_DEPS", "ON")
@@ -64,7 +84,10 @@ fn main() {
     // require newer, more complete clang-static package versions (20 or so).
     // We get around that by building everything except the eBPF objects with one version
     // of clang/llvm, but using a specific older version override to build the `modern_bpf` progs here.
-    if let Ok(clang_exe) = env::var("MODERN_CLANG_EXE") {
+    if let Some(shim) = &modern_clang_shim {
+        // The shim wraps MODERN_CLANG_EXE (or plain `clang`) in the launcher.
+        cmake_config.define("MODERN_CLANG_EXE", shim);
+    } else if let Ok(clang_exe) = env::var("MODERN_CLANG_EXE") {
         println!("cargo:info=Using MODERN_CLANG_EXE={}", clang_exe);
         cmake_config.define("MODERN_CLANG_EXE", clang_exe);
     }
@@ -247,6 +270,48 @@ fn run_git(args: &[&str]) -> Result<()> {
         bail!("`git {}` failed with {}", args.join(" "), status);
     }
     Ok(())
+}
+
+/// Write a tiny wrapper script that runs `tool` through the configured
+/// compiler launcher (sccache/ccache), for build steps that don't honor
+/// CMAKE_C_COMPILER_LAUNCHER on their own.
+fn write_shim(out_dir: &Path, name: &str, launcher: &str, tool: &str) -> Result<PathBuf> {
+    let path = out_dir.join(name);
+    fs::write(&path, format!("#!/bin/sh\nexec {launcher} {tool} \"$@\"\n"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms)?;
+    }
+    Ok(path)
+}
+
+/// libscap builds libbpf via an ExternalProject BUILD_COMMAND that invokes
+/// raw `make`: it cannot inherit the jobserver (so it builds -j1) and its CC
+/// is never routed through the compiler launcher. Patch the pinned cmake
+/// module to parallelize it and (when a launcher is active) wrap CC.
+fn patch_libbpf_build(repo_dir: &Path, cc_shim: Option<&Path>) {
+    let module = repo_dir.join("cmake/modules/libbpf.cmake");
+    let Ok(text) = fs::read_to_string(&module) else {
+        return;
+    };
+    let jobs = env::var("NUM_JOBS").unwrap_or_else(|_| "1".to_string());
+    let mut replacement = format!("make -j{jobs}");
+    if let Some(shim) = cc_shim {
+        replacement.push_str(&format!(" CC={}", shim.display()));
+    }
+    replacement.push_str(" BUILD_STATIC_ONLY=y");
+    let patched = text.replace("make BUILD_STATIC_ONLY=y", &replacement);
+    if patched != text {
+        let _ = fs::write(&module, patched);
+    } else if !text.contains("make -j") {
+        println!(
+            "cargo:warning=libbpf.cmake BUILD_COMMAND pattern not found; \
+             libbpf will build single-threaded without the compiler launcher"
+        );
+    }
 }
 
 /// This will check to see if a tarfile matching our desired checksum already exists
