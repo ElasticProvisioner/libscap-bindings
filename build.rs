@@ -34,50 +34,14 @@ fn main() {
     let target = std::env::var("TARGET").unwrap();
     let is_musl = target.contains("musl");
 
-    if !repo_dir.exists() {
-        let status = Command::new("git")
-            .args(["clone", LIBSCAP_REPO, repo_dir.to_str().unwrap()])
-            .status()
-            .expect("Failed to clone repository");
-
-        if !status.success() {
-            panic!("Failed to clone repository");
-        }
-
-        let checkout_dir = fs::canonicalize(repo_dir.clone()).unwrap();
-
-        let status = Command::new("git")
-            .args(["checkout", LIBSCAP_CHECKOUT_SHA])
-            .current_dir(checkout_dir)
-            .status()
-            .expect("Failed to checkout ref {}");
-
-        if !status.success() {
-            panic!("Failed to checkout repository");
-        }
+    if !repo_dir.exists()
+        && let Err(err) = clone_libscap(&repo_dir)
+    {
+        // Remove the partially-initialized repo so the next build attempt
+        // starts from scratch instead of trusting whatever half-state exists.
+        let _ = fs::remove_dir_all(&repo_dir);
+        panic!("Failed to fetch libscap sources: {err}");
     }
-
-    // TODO(bml) - Git 2.49 adds --revision, so the above can be replaced with this,
-    // which is faster. Unfortunately not all runners/cross envs have that one yet.
-
-    // if !repo_dir.exists() {
-    //     println!("cargo:info=Cloning external repository...");
-
-    //     let status = Command::new("git")
-    //         .args([
-    //             "clone",
-    //             "--revision",
-    //             libscap_checkout_sha,
-    //             "https://github.com/falcosecurity/libs.git",
-    //             repo_dir.to_str().unwrap(),
-    //         ])
-    //         .status()
-    //         .expect("Failed to clone repository");
-
-    //     if !status.success() {
-    //         panic!("Failed to clone repository");
-    //     }
-    // }
 
     // the `bpftool` binary is a build dep of libscap.
     // This attemts to fetch and extract it into the build directory,
@@ -246,6 +210,43 @@ fn main() {
         .expect("Couldn't write bindings!");
 
     println!("cargo:rerun-if-changed=build.rs");
+}
+
+/// Fetch only the pinned commit rather than cloning full history (~4 MB of
+/// pack data instead of ~44 MB). Fetching by SHA is content-addressed, so the
+/// checked-out tree is cryptographically verified against
+/// `LIBSCAP_CHECKOUT_SHA`. Git 2.49's `clone --revision=<sha>` does this in
+/// one step, but not all runners/cross environments ship it yet.
+fn clone_libscap(repo_dir: &Path) -> Result<()> {
+    let repo = repo_dir.to_str().unwrap();
+    run_git(&["init", repo])?;
+    run_git(&["-C", repo, "remote", "add", "origin", LIBSCAP_REPO])?;
+    run_git(&[
+        "-C",
+        repo,
+        "fetch",
+        "--depth=1",
+        "origin",
+        LIBSCAP_CHECKOUT_SHA,
+    ])?;
+    run_git(&[
+        "-C",
+        repo,
+        "-c",
+        "advice.detachedHead=false",
+        "checkout",
+        "--detach",
+        "FETCH_HEAD",
+    ])?;
+    Ok(())
+}
+
+fn run_git(args: &[&str]) -> Result<()> {
+    let status = Command::new("git").args(args).status()?;
+    if !status.success() {
+        bail!("`git {}` failed with {}", args.join(" "), status);
+    }
+    Ok(())
 }
 
 /// This will check to see if a tarfile matching our desired checksum already exists
