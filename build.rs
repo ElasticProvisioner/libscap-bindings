@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use flate2::read::GzDecoder;
 use std::{
     env, fs,
@@ -383,15 +383,21 @@ fn download_bpftool_bytes(arch: &str, expected_sha: &str) -> Result<Vec<u8>> {
         archive_name(arch)
     );
 
-    let response = reqwest::blocking::get(&url)?;
-    if !response.status().is_success() {
-        bail!(format!(
-            "failed to download bpftool: HTTP {:?}",
-            response.status()
-        ));
-    }
+    // ureq (rustls + ring, bundled webpki roots) follows the GitHub release
+    // redirect to the CDN and returns an error on a non-2xx status. Its
+    // read_to_vec() defaults to a 10 MiB cap and the bpftool tarball is already
+    // ~9.6 MiB, so raise the limit well clear of the release size while still
+    // bounding memory. The download is content-verified against expected_sha
+    // below, so TLS here is defense in depth.
+    let content = ureq::get(&url)
+        .call()
+        .with_context(|| format!("downloading bpftool from {url}"))?
+        .body_mut()
+        .with_config()
+        .limit(64 * 1024 * 1024)
+        .read_to_vec()
+        .with_context(|| format!("reading bpftool response body from {url}"))?;
 
-    let content = response.bytes()?.to_vec();
     let actual_checksum = sha256::digest(content.as_slice());
     if actual_checksum != expected_sha {
         bail!(
