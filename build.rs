@@ -1,10 +1,10 @@
-use anyhow::{Result, bail};
+use anyhow::{Result, anyhow, bail};
 use flate2::read::GzDecoder;
 use std::{
     env, fs,
-    io::{Read, Write},
     path::{Path, PathBuf},
     process::Command,
+    thread,
 };
 use tar::Archive;
 
@@ -34,6 +34,13 @@ fn main() {
     let target = std::env::var("TARGET").unwrap();
     let is_musl = target.contains("musl");
 
+    // The `bpftool` binary is a build dep of libscap. Start its download in
+    // the background so it overlaps with the git fetch below (both are
+    // network-bound); it is then extracted into the repo dir so we can tell
+    // libscap's CMAKE to use the local one, rather than try to find a system
+    // binary.
+    let bpftool_download = spawn_bpftool_download(&repo_dir);
+
     if !repo_dir.exists()
         && let Err(err) = clone_libscap(&repo_dir)
     {
@@ -43,10 +50,8 @@ fn main() {
         panic!("Failed to fetch libscap sources: {err}");
     }
 
-    // the `bpftool` binary is a build dep of libscap.
-    // This attemts to fetch and extract it into the build directory,
-    // so we can tell libscap's CMAKE to use the local one, rather than try to find a system binary.
-    let relative_exe = fetch_bpftool(&repo_dir).expect("must fetch bpftool build dep");
+    let relative_exe =
+        install_bpftool(&repo_dir, bpftool_download).expect("must fetch bpftool build dep");
 
     // The cmake-generated compile rules honor CMAKE_C_COMPILER_LAUNCHER
     // (sccache/ccache) from the environment, but two libscap build steps
@@ -272,6 +277,49 @@ fn run_git(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+type BpftoolDownload = Option<thread::JoinHandle<Result<Vec<u8>>>>;
+
+/// Start the bpftool release download on a background thread so it overlaps
+/// with the libscap git fetch. Skipped (returns None) when a previously
+/// downloaded archive with a good checksum is already in place.
+fn spawn_bpftool_download(repo_dir: &Path) -> BpftoolDownload {
+    let (arch, expected_sha) = get_arch_sha();
+    let archive = repo_dir.join("bpftool").join(archive_name(&arch));
+    if archive_checksum_ok(&archive, &expected_sha) {
+        return None;
+    }
+    Some(thread::spawn(move || {
+        download_bpftool_bytes(&arch, &expected_sha)
+    }))
+}
+
+/// Extract the bpftool binary into `<repo>/bpftool/`, first landing the
+/// background download if one was started (otherwise the verified,
+/// previously downloaded archive is reused).
+fn install_bpftool(repo_dir: &Path, download: BpftoolDownload) -> Result<String> {
+    let (arch, _) = get_arch_sha();
+    let bpftool_dir = repo_dir.join("bpftool");
+    let archive_name = archive_name(&arch);
+    if let Some(handle) = download {
+        let bytes = handle
+            .join()
+            .map_err(|_| anyhow!("bpftool download thread panicked"))??;
+        // Replace whatever stale or partial state exists before unpacking.
+        let _ = fs::remove_dir_all(&bpftool_dir);
+        fs::create_dir_all(&bpftool_dir)?;
+        fs::write(bpftool_dir.join(&archive_name), &bytes)?;
+    }
+    extract_bpftool(&archive_name, &bpftool_dir)
+}
+
+fn archive_name(arch: &str) -> String {
+    format!("bpftool-v{}-{}.tar.gz", BPFTOOL_VERSION, arch)
+}
+
+fn archive_checksum_ok(archive: &Path, expected_sha: &str) -> bool {
+    fs::read(archive).is_ok_and(|bytes| sha256::digest(bytes.as_slice()) == expected_sha)
+}
+
 /// Write a tiny wrapper script that runs `tool` through the configured
 /// compiler launcher (sccache/ccache), for build steps that don't honor
 /// CMAKE_C_COMPILER_LAUNCHER on their own.
@@ -314,44 +362,6 @@ fn patch_libbpf_build(repo_dir: &Path, cc_shim: Option<&Path>) {
     }
 }
 
-/// This will check to see if a tarfile matching our desired checksum already exists
-/// at the target path. If it does, then extract it and use the binary.
-/// If it does not, then delete the target path and refetch, then extract the binary.
-fn fetch_bpftool(out_dir: &Path) -> Result<String> {
-    let bpftool_dir = out_dir.join("bpftool/");
-    let (arch, expected_sha) = get_arch_sha();
-    let archive_name = format!("bpftool-v{}-{}.tar.gz", BPFTOOL_VERSION, arch);
-    let bpftool_archive = bpftool_dir.join(&archive_name);
-
-    // Check if archive was previously downloaded and verify its checksum.
-    // If it wasn't, or checksum seems wrong, delete everything and signal refetch.
-    let should_download = if bpftool_archive.exists() {
-        let mut file = fs::File::open(&bpftool_archive)?;
-        let mut contents = Vec::new();
-        file.read_to_end(&mut contents)?;
-
-        let actual_checksum = sha256::digest(&contents);
-
-        if actual_checksum == expected_sha {
-            false
-        } else {
-            println!("cargo:error=bpftool checksum mismatch, redownloading");
-            let _ = fs::remove_dir_all(&bpftool_dir);
-            true
-        }
-    } else {
-        let _ = fs::remove_dir_all(&bpftool_dir);
-        true
-    };
-
-    let _ = fs::create_dir_all(&bpftool_dir);
-    if should_download {
-        download_bpftool(&expected_sha, &archive_name, &bpftool_dir)?;
-    }
-
-    extract_bpftool(&archive_name, &bpftool_dir)
-}
-
 fn get_arch_sha() -> (String, String) {
     let target = env::var("TARGET").expect("rust builds should have a target");
     if !target.contains("linux") {
@@ -366,10 +376,12 @@ fn get_arch_sha() -> (String, String) {
     }
 }
 
-fn download_bpftool(expected_sha: &str, archive_name: &str, bpftool_dir: &Path) -> Result<()> {
+fn download_bpftool_bytes(arch: &str, expected_sha: &str) -> Result<Vec<u8>> {
     let url = format!(
         "{}/v{}/{}",
-        BPFTOOL_RELEASE_URL, BPFTOOL_VERSION, archive_name
+        BPFTOOL_RELEASE_URL,
+        BPFTOOL_VERSION,
+        archive_name(arch)
     );
 
     let response = reqwest::blocking::get(&url)?;
@@ -380,8 +392,8 @@ fn download_bpftool(expected_sha: &str, archive_name: &str, bpftool_dir: &Path) 
         ));
     }
 
-    let content = response.bytes()?;
-    let actual_checksum = sha256::digest(content.as_ref());
+    let content = response.bytes()?.to_vec();
+    let actual_checksum = sha256::digest(content.as_slice());
     if actual_checksum != expected_sha {
         bail!(
             "checksum mismatch downloading {}: expected: {}, got: {}",
@@ -390,16 +402,12 @@ fn download_bpftool(expected_sha: &str, archive_name: &str, bpftool_dir: &Path) 
             actual_checksum
         );
     }
-
-    let tarball_path = bpftool_dir.join(archive_name);
-    let mut tarball_file = fs::File::create(&tarball_path)?;
-    tarball_file.write_all(&content)?;
-    Ok(())
+    Ok(content)
 }
 
 /// returns a relative path to the bpftool binary as a string (like `bpftool/bpftool`).
 /// this is in the format (binary-parent-dir/binary) as that is what cmake will understand.
-fn extract_bpftool(archive_name: &str, bpftool_dir: &PathBuf) -> Result<String> {
+fn extract_bpftool(archive_name: &str, bpftool_dir: &Path) -> Result<String> {
     let tarball_path = bpftool_dir.join(archive_name);
     let tarball_file = fs::File::open(&tarball_path)?;
     let tar_gz = GzDecoder::new(tarball_file);
